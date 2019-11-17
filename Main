@@ -1,0 +1,384 @@
+# ECON3382 Computational Investing 
+###### Members: Barry Qie, Dehao Yuan, Sherry Lin (Alphabetical Order)
+
+## Stationary Portfolio Construction
+* [Step 1: Get the stock price.](#1)
+* [Step 2: Compute stationary matrix.](#2)
+* [Step 3: Compute optimal portfolio.](#3) 
+* [Step 4: Output the weights.](#4)
+* [Step 5: Get the portfolio price.](#5)
+* [Step 6: Stationary Test in new periods](#6)
+
+## README
+* Here is the [Project Proposal](https://drive.google.com/open?id=16V2bYNoaRRau_cfTC_LXMwtqL-aWmd_0). 
+* To check the outline, simply check the [main function](#0) and its output.
+* To check the details, [here](#b) is the breakdown.
+
+from quantopian.research import run_pipeline
+from quantopian.pipeline import Pipeline
+from quantopian.research import prices, symbols
+from quantopian.pipeline.data import Fundamentals
+from quantopian.pipeline.data.sentdex import sentiment
+from quantopian.pipeline.data.builtin import USEquityPricing
+from quantopian.pipeline.filters import  StaticAssets, StaticSids
+from quantopian.pipeline.filters.morningstar import Q500US
+from quantopian.pipeline.classifiers.morningstar import Sector
+
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LinearRegression
+from sklearn.svm import SVR
+from statsmodels.tsa.stattools import adfuller
+from scipy.interpolate import interp1d
+import matplotlib.pyplot as plt
+from datetime import datetime
+
+
+base_universe = Q500US()
+sector = Fundamentals.morningstar_sector_code.latest
+
+basic_materials = sector.element_of([101]) & base_universe
+cons_cyclical = sector.element_of([102]) & base_universe
+real_estate = sector.element_of([103]) & base_universe
+cons_defensive = sector.element_of([205]) & base_universe
+healthcare = sector.element_of([206]) & base_universe
+utilities = sector.element_of([207]) & base_universe
+comm_services = sector.element_of([308]) & base_universe
+energy = sector.element_of([309]) & base_universe
+industrials = sector.element_of([310]) & base_universe
+tech = sector.element_of([311]) & base_universe
+
+
+<a id='0'></a>
+## MAIN FUNCTION
+
+
+##############################https://research-i-0b40635fa06ebbe7f.prd.int.dynoquant.com/user/5cf38dfee27f6a003e5aec01/notebooks/ECON3382%20Project/Complete_main.ipynb#MAIN-FUNCTION
+###### Hyper-parameters ######
+##############################
+train_start = '2005-01-01'
+train_end = '2011-01-01'
+field = 'close'
+sector = tech
+##############################
+###### Hyper-parameters ######
+##############################
+
+# Step 1: Get the stock price and the security identities.
+stockprice, sids = get_stock_price(sector, start_time=train_start, end_time=train_end, fields=field)
+print 'stockprice is a DataFrame with the shape: ', stockprice.shape
+print 'sids is a NumPy array with the shape: ', sids.shape
+
+# Step 2: Compute the "stationary matrix".
+stationary_matrix = get_stationary_matrix(stockprice, sids)
+print 'stationary_matrix is a symmetrical matrix with the shape: ', stationary_matrix.shape
+print 'take a glance on the stationary matrix: \n', stationary_matrix[0:5,0:5]
+
+# Step 3: Construct the portfolio according to the stationary matrix.
+tree_list = get_portfolio_tree(stockprice, sids, stationary_matrix, max_num_stocks=30)
+print 'tree_list is a list of binary tree, which stores the information of the portfolio.'
+print 'An instance of the binary tree is: '
+tree_list[0].print_tree(0)
+
+# Step 4: Get the weights of each portfolios.
+weights = reconstruct_portfolio(tree_list)
+print 'The final output is a DataFrame which stores how many "weights" should be placed on each stock: '
+print weights[0].tail()
+print ('')
+
+print_code(weights)
+
+
+
+trade_start = '2005-01-01'
+trade_end = '2018-01-01'
+for max_num_stocks in range(2,len(sids)):
+    tree_list = get_portfolio_tree(stockprice, sids, stationary_matrix, max_num_stocks=max_num_stocks)
+    weights = reconstruct_portfolio(tree_list)
+    for i in range(len(weights)):
+        plt.axvline(x=datetime(int(train_end[0:4]),1,1))
+        plt.plot(get_portfolio_price(weights[i], trade_start, trade_end, 'price', frequency = 'daily'), alpha=0.7,
+                label='#stocks: '+str(len(weights[i])))
+    plt.xlabel('time')
+    plt.ylabel('price')
+    plt.title('max #stocks: '+str(max_num_stocks))
+    plt.legend()
+    plt.show()
+    
+    
+    
+
+################################################################################################
+################################################################################################
+
+<a id='I'></a>
+# Stationary Portfolio Construction
+<a id='1'></a>
+### Step 1: Given the sector, staring time and ending time, return the stock price.
+
+# USEquityPricing: open, high, low, close
+def get_stock_price(sector, start_time, end_time, fields='close'):    #frequency: daily
+    if fields == 'open':
+        pipe = Pipeline(columns={'price' : USEquityPricing.open.latest},screen=sector)
+    elif fields == 'high':
+        pipe = Pipeline(columns={'price' : USEquityPricing.high.latest},screen=sector)
+    elif fields == 'low':
+        pipe = Pipeline(columns={'price' : USEquityPricing.low.latest},screen=sector)
+    else:
+        pipe = Pipeline(columns={'price' : USEquityPricing.close.latest},screen=sector)
+
+    results = run_pipeline(pipe, start_time, end_time)
+    unstacked_results = results.unstack()
+    unstacked_results = unstacked_results.dropna(axis=1, how='any')
+    sids = unstacked_results.columns
+    returned_sids = np.zeros(len(sids), dtype='u4')
+    for i in range(len(sids)):
+        returned_sids[i] = sids[i][1].sid
+    unstacked_results.columns = returned_sids
+    return unstacked_results, returned_sids
+
+
+
+################################################################################################
+################################################################################################
+
+<a id='2'></a>
+### Step 2: Get the stationary matrix.
+The stationary matrix is defined to be:
+
+$A^0=\left[a_{ij}\right]$, where $a_{ij}=ADF(s_i-\beta_{ij}s_j)$, and $\beta_{ij}$ is the regression slope and $a_{ii}=ADF(s_i)$.
+* Notice that $a_{ij}$ measures the stationarility of the pair trading of $s_i$ and $s_j$. $a_{ii}$ measures the stationarility of an individual stock.
+
+
+def get_stationary_matrix(price, sids):
+    stationary_matrix = np.zeros([len(sids), len(sids)])
+    n = len(sids)
+    for i in range(0,n-1):
+        for j in range(i,n):
+            beta = LinearRegression().fit(price.values[:,i].reshape(-1,1), price.values[:,j].reshape(-1,1))
+            beta = np.asscalar(beta.coef_)
+            stationary_matrix[i,j] = adfuller(price.values[:,j]-beta*price.values[:,i])[1]
+        
+    for i in range(n):
+        stationary_matrix[i,i] = adfuller(price.values[:,i])[1]
+        
+    stationary_matrix = stationary_matrix + stationary_matrix.T
+    stationary_matrix[0:n,0:n] = stationary_matrix[0:n,0:n] / 2
+    return stationary_matrix
+    
+    
+    
+
+################################################################################################
+################################################################################################
+
+
+<a id='3'></a>
+### Step 3: Construct portfolios according to the stationary matrix.
+The detail of the algorithm is:
+* Find the entry $a_{mn}$ such that $a_{mn}<a_{mm}$ and $a_{mn}<a_{nn}$. Replace $s_m$ and $s_n$ with a combo of $s_m$ and $s_n$: $s_m-\beta_{mn}s_n$. Record $(m,n)$ and recompute the ADF matrix $A^1=\left[a_{ij}\right]$.
+* Recursively do that until there is no entry with $a_{ij}<a_{ii}$ and $a_{ij}<a_{jj}$ for all $a_{ij}\in A^k$, where $k \in \mathbb{N}$.
+
+
+def get_portfolio_tree(price, sids, stationary_matrix, verbose=False, max_num_stocks=10):
+    price_copy = price.copy()
+    stationary_matrix_copy = stationary_matrix.copy()
+    
+    tree = []
+    for sid in sids:
+        tree.append(Portfolio(sid=sid))
+
+    while True:
+        N = len(stationary_matrix_copy)
+
+        # Find good pair trading.
+        diag = stationary_matrix_copy[np.arange(N),np.arange(N)]
+        cols = np.tile(diag, (N,1))
+        rows = cols.T
+        stationary_matrix_copy[(stationary_matrix_copy>cols)&(stationary_matrix_copy>rows)] = np.nan
+        col_diff = cols - stationary_matrix_copy
+        row_diff = rows - stationary_matrix_copy
+        multiply_diff = col_diff * row_diff
+        if np.nanmax(multiply_diff) > 0:
+            indices = np.where(multiply_diff==np.nanmax(multiply_diff))
+            combine_x = min(indices[0][0], indices[1][0])
+            combine_y = max(indices[0][0], indices[1][0])
+            if tree[combine_x].num_stocks > max_num_stocks or tree[combine_y].num_stocks > max_num_stocks:
+                stationary_matrix_copy[combine_x][combine_y] = (diag[combine_x]+diag[combine_y]) / 2
+                stationary_matrix_copy[combine_y][combine_x] = (diag[combine_x]+diag[combine_y]) / 2
+                continue
+
+        else:
+            # If there is no good trading, end the loop.
+            break
+
+        # Manipulate the price.
+        price_x = price_copy[price_copy.columns[combine_x]]
+        price_y = price_copy[price_copy.columns[combine_y]]
+        beta_xy = LinearRegression().fit(price_x.values.reshape(-1,1), price_y.values.reshape(-1,1))
+        beta_xy = np.asscalar(beta_xy.coef_)
+        price_copy[price_copy.columns[combine_x]] = price_y.values - beta_xy * price_x.values
+        price_copy = price_copy.drop(price_copy.columns[combine_y], axis=1)
+
+        # Manipulate the stationary matrix.
+        stationary_matrix_copy = np.delete(stationary_matrix_copy, combine_y, axis=0)
+        stationary_matrix_copy = np.delete(stationary_matrix_copy, combine_y, axis=1)
+        stationary_matrix_copy[combine_x,combine_x] = adfuller(price_copy[price_copy.columns[combine_x]])[1]
+        for i in np.setdiff1d(np.arange(N-1), combine_x):
+            price_y = price_copy[price_copy.columns[i]]
+            beta = LinearRegression().fit(price_x.values.reshape(-1,1), price_y.values.reshape(-1,1))
+            beta = np.asscalar(beta.coef_)
+            stationary_matrix_copy[combine_x,i] = adfuller(price_y.values - beta * price_x.values)[1]
+            stationary_matrix_copy[i,combine_x] = stationary_matrix_copy[combine_x,i]
+
+        # Manipulate the tree list.
+        update_tree(tree, combine_x, combine_y, beta_xy)
+
+        if verbose:
+            print '>',
+
+    if verbose:
+        print ''
+        print 'Final number of the trees: ', len(tree)
+    return tree
+
+*The Portfolio object is a binary tree to store the portfolio information.*
+
+class Portfolio:
+    """
+    It is a node storing information of a portfolio.
+    
+    """
+    def __init__(self, sid=None, left=None, right=None, beta=None, empty=False):
+        if empty:
+            # Empty node.
+            self.sid = None
+            self.left = None
+            self.right = None
+            self.beta = None
+            self.num_stocks = 0
+            self.isempty = True
+        else:
+            if sid is not None:
+                # If the node is a single stock, store the sid.
+                self.sid = sid
+                self.left = Portfolio(empty=True)
+                self.right = Portfolio(empty=True)
+                self.beta = None
+                self.num_stocks = 1
+                self.isempty = False
+            else:
+                # If the node is a combo, store the left and the right nodes and the beta.
+                self.sid = None
+                self.left = left
+                self.right = right
+                self.beta = beta
+                self.num_stocks = left.num_stocks + right.num_stocks
+                self.isempty = False
+        
+
+    def print_tree(self, depth=0):
+        """Print the tree with a rotation of 90 degrees."""
+        if self.isempty:
+            return
+
+        self.right.print_tree(depth+1)
+
+        for i in range(depth):
+            print '\t',
+        if self.sid is not None:
+            print self.sid
+        else:
+            print round(self.beta*100) / 100
+
+        self.left.print_tree(depth+1)
+
+    def construct_portfolio(self, sids, weights, multiple=1):
+        if self.sid is not None:
+            sids.append(self.sid)
+            weights.append(multiple)
+        else:
+            self.right.construct_portfolio(sids, weights, multiple*(-self.beta))
+            self.left.construct_portfolio(sids, weights, multiple)
+
+
+def update_tree(tree, combine_x, combine_y, beta):
+    new_tree = Portfolio(left=tree[combine_y], right=tree[combine_x], beta=beta)
+    tree[combine_x] = new_tree
+    del tree[combine_y]
+
+
+
+################################################################################################
+################################################################################################
+
+<a id='4'></a>
+### Step 4: Compute the weight of each stock from the Portfolio tree.
+
+
+def reconstruct_portfolio(tree_list):
+    weights = []
+    for tree in tree_list:
+        sid = []
+        weight = []
+        tree.construct_portfolio(sids=sid, weights=weight)
+        output = pd.DataFrame(np.zeros([len(sid), 2]), columns=['sid', 'weight'])
+        output['sid'] = np.array(sid)
+        output['weight'] = np.array(weight)
+        weights.append(output)
+    return weights
+
+################################################################################################
+################################################################################################
+
+
+<a id='5'></a>
+### Step 5: Get the portfolio price.
+Construct the price of the portfolio according to the weight.
+
+
+
+def get_portfolio_price(weight, start_time, end_time, pfield, frequency):
+    """
+    pfield: 'price', 'open_price', 'high', 'low', 'close_price', 'volume'
+    frequency: 'daily', 'minute'
+    
+    """
+    assets = weight['sid']
+    price = get_pricing(assets, start_time, end_time, fields=pfield)
+    portfolio_price = np.dot(price, weight['weight'])
+    return pd.Series(portfolio_price, index=price.index)
+    
+
+################################################################################################
+################################################################################################
+
+
+<a id='6'></a>
+### Step 6: Test the stationarity in new periods.
+The stationarity is given by the Hurst exponent.
+
+
+def get_overfitting_adf(portfoliop_series):
+    adf =  adfuller(portfoliop_series.values)
+    return adf[1]
+
+
+################################################################################################
+################################################################################################
+
+### Step 7: Transfer the weights to the IDE.
+
+def print_code(weights):
+    for weight in weights:
+        print ('sids = np.array(['),
+        for i in range(len(weight)):
+            print(str(weight['sid'][i])+','),
+        print ('\b\b'),
+        print ('])')
+        print ('weights = np.array(['),
+        for i in range(len(weight)):
+            print(str(weight['weight'][i])+','),
+        print ('\b\b'),
+        print ('])')
+        print ('')
