@@ -1,0 +1,486 @@
+from quantopian.research import run_pipeline
+from quantopian.pipeline import Pipeline
+from quantopian.research import prices, symbols
+from quantopian.pipeline.data import Fundamentals
+from quantopian.pipeline.data.sentdex import sentiment
+from quantopian.pipeline.data.builtin import USEquityPricing
+from quantopian.pipeline.filters import  StaticAssets, StaticSids
+from quantopian.pipeline.filters.morningstar import Q500US
+from quantopian.pipeline.classifiers.morningstar import Sector
+
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LinearRegression
+from sklearn.svm import SVR
+from statsmodels.tsa.stattools import adfuller
+from scipy.interpolate import interp1d
+import matplotlib.pyplot as plt
+from datetime import datetime
+
+
+
+base_universe = Q500US()
+sector = Fundamentals.morningstar_sector_code.latest
+
+basic_materials = sector.element_of([101]) & base_universe
+cons_cyclical = sector.element_of([102]) & base_universe
+real_estate = sector.element_of([103]) & base_universe
+cons_defensive = sector.element_of([205]) & base_universe
+healthcare = sector.element_of([206]) & base_universe
+utilities = sector.element_of([207]) & base_universe
+comm_services = sector.element_of([308]) & base_universe
+energy = sector.element_of([309]) & base_universe
+industrials = sector.element_of([310]) & base_universe
+tech = sector.element_of([311]) & base_universe
+
+
+
+##############################
+###### Hyper-parameters ######
+##############################
+train_start = '2018-07-01'    #5 months window
+train_end = '2018-12-01'
+trade_start = '2018-12-01'
+trade_end = '2019-01-01'
+field = 'close'
+sector = tech
+max_num_stocks = 9        #opt max number stocks
+
+
+###########################################################################################################
+################################### Defining preparatory functions#####################################################
+
+
+# USEquityPricing: open, high, low, close
+def get_stock_price(sector, start_time, end_time, fields='close'):    #frequency: daily
+    if fields == 'open':
+        pipe = Pipeline(columns={'price' : USEquityPricing.open.latest},screen=sector)
+    elif fields == 'high':
+        pipe = Pipeline(columns={'price' : USEquityPricing.high.latest},screen=sector)
+    elif fields == 'low':
+        pipe = Pipeline(columns={'price' : USEquityPricing.low.latest},screen=sector)
+    else:
+        pipe = Pipeline(columns={'price' : USEquityPricing.close.latest},screen=sector)
+
+    results = run_pipeline(pipe, start_time, end_time)
+    unstacked_results = results.unstack()
+    unstacked_results = unstacked_results.dropna(axis=1, how='any')
+    sids = unstacked_results.columns
+    returned_sids = np.zeros(len(sids), dtype='u4')
+    for i in range(len(sids)):
+        returned_sids[i] = sids[i][1].sid
+    unstacked_results.columns = returned_sids
+    return unstacked_results, returned_sids
+    
+    
+def get_stationary_matrix(price, sids):
+    stationary_matrix = np.zeros([len(sids), len(sids)])
+    n = len(sids)
+    for i in range(0,n-1):
+        for j in range(i,n):
+            beta = LinearRegression().fit(price.values[:,i].reshape(-1,1), price.values[:,j].reshape(-1,1))
+            beta = np.asscalar(beta.coef_)
+            stationary_matrix[i,j] = adfuller(price.values[:,j]-beta*price.values[:,i])[1]
+        
+    for i in range(n):
+        stationary_matrix[i,i] = adfuller(price.values[:,i])[1]
+        
+    stationary_matrix = stationary_matrix + stationary_matrix.T
+    stationary_matrix[0:n,0:n] = stationary_matrix[0:n,0:n] / 2
+    return stationary_matrix
+    
+    
+
+def get_portfolio_tree(price, sids, stationary_matrix, verbose=False, max_cap = max_num_stocks):
+    price_copy = price.copy()
+    stationary_matrix_copy = stationary_matrix.copy()
+    
+    tree = []
+    for sid in sids:
+        tree.append(Portfolio(sid=sid))
+
+    while True:
+        N = len(stationary_matrix_copy)
+
+        # Find good pair trading.
+        diag = stationary_matrix_copy[np.arange(N),np.arange(N)]
+        cols = np.tile(diag, (N,1))
+        rows = cols.T
+        stationary_matrix_copy[(stationary_matrix_copy>cols)&(stationary_matrix_copy>rows)] = np.nan
+        col_diff = cols - stationary_matrix_copy
+        row_diff = rows - stationary_matrix_copy
+        multiply_diff = col_diff * row_diff
+        if np.nanmax(multiply_diff) > 0:
+            indices = np.where(multiply_diff==np.nanmax(multiply_diff))
+            combine_x = min(indices[0][0], indices[1][0])
+            combine_y = max(indices[0][0], indices[1][0])
+            if tree[combine_x].num_stocks + tree[combine_y].num_stocks > max_num_stocks:
+                stationary_matrix_copy[combine_x][combine_y] = (diag[combine_x]+diag[combine_y]) / 2
+                stationary_matrix_copy[combine_y][combine_x] = (diag[combine_x]+diag[combine_y]) / 2
+                continue
+
+        else:
+            # If there is no good trading, end the loop.
+            break
+
+        # Manipulate the price.
+        price_x = price_copy[price_copy.columns[combine_x]]
+        price_y = price_copy[price_copy.columns[combine_y]]
+        beta_xy = LinearRegression().fit(price_x.values.reshape(-1,1), price_y.values.reshape(-1,1))
+        beta_xy = np.asscalar(beta_xy.coef_)
+        price_copy[price_copy.columns[combine_x]] = price_y.values - beta_xy * price_x.values
+        price_copy = price_copy.drop(price_copy.columns[combine_y], axis=1)
+
+        # Manipulate the stationary matrix.
+        stationary_matrix_copy = np.delete(stationary_matrix_copy, combine_y, axis=0)
+        stationary_matrix_copy = np.delete(stationary_matrix_copy, combine_y, axis=1)
+        stationary_matrix_copy[combine_x,combine_x] = adfuller(price_copy[price_copy.columns[combine_x]])[1]
+        for i in np.setdiff1d(np.arange(N-1), combine_x):
+            price_y = price_copy[price_copy.columns[i]]
+            beta = LinearRegression().fit(price_x.values.reshape(-1,1), price_y.values.reshape(-1,1))
+            beta = np.asscalar(beta.coef_)
+            stationary_matrix_copy[combine_x,i] = adfuller(price_y.values - beta * price_x.values)[1]
+            stationary_matrix_copy[i,combine_x] = stationary_matrix_copy[combine_x,i]
+
+        # Manipulate the tree list.
+        update_tree(tree, combine_x, combine_y, beta_xy)
+
+        if verbose:
+            print '>',
+
+    if verbose:
+        print ''
+        print 'Final number of the trees: ', len(tree)
+    return tree
+
+
+class Portfolio:
+    """
+    It is a node storing information of a portfolio.
+    
+    """
+    def __init__(self, sid=None, left=None, right=None, beta=None, empty=False):
+        if empty:
+            # Empty node.
+            self.sid = None
+            self.left = None
+            self.right = None
+            self.beta = None
+            self.num_stocks = 0
+            self.isempty = True
+        else:
+            if sid is not None:
+                # If the node is a single stock, store the sid.
+                self.sid = sid
+                self.left = Portfolio(empty=True)
+                self.right = Portfolio(empty=True)
+                self.beta = None
+                self.num_stocks = 1
+                self.isempty = False
+            else:
+                # If the node is a combo, store the left and the right nodes and the beta.
+                self.sid = None
+                self.left = left
+                self.right = right
+                self.beta = beta
+                self.num_stocks = left.num_stocks + right.num_stocks
+                self.isempty = False
+        
+        
+    def print_tree(self, depth=0):
+        """Print the tree with a rotation of 90 degrees."""
+        if self.isempty:
+            return
+
+        self.right.print_tree(depth+1)
+
+        for i in range(depth):
+            print '\t',
+        if self.sid is not None:
+            print self.sid
+        else:
+            print round(self.beta*100) / 100
+
+        self.left.print_tree(depth+1)
+
+
+    def construct_portfolio(self, sids, weights, multiple=1):
+        if self.sid is not None:
+            sids.append(self.sid)
+            weights.append(multiple)
+        else:
+            self.right.construct_portfolio(sids, weights, multiple*(-self.beta))
+            self.left.construct_portfolio(sids, weights, multiple)
+
+
+def update_tree(tree, combine_x, combine_y, beta):
+    new_tree = Portfolio(left=tree[combine_y], right=tree[combine_x], beta=beta)
+    tree[combine_x] = new_tree
+    del tree[combine_y]
+    
+    
+def reconstruct_portfolio(tree_list):
+    weights = []
+    for tree in tree_list:
+        sid = []
+        weight = []
+        tree.construct_portfolio(sids=sid, weights=weight)
+        output = pd.DataFrame(np.zeros([len(sid), 2]), columns=['sid', 'weight'])
+        output['sid'] = np.array(sid)
+        output['weight'] = np.array(weight)
+        weights.append(output)
+    return weights
+    
+    
+def get_portfolio_price(weight, start_time, end_time, pfield, frequency):
+    """
+    pfield: 'price', 'open_price', 'high', 'low', 'close_price', 'volume'
+    frequency: 'daily', 'minute'
+    
+    """
+    assets = weight['sid']
+    price = get_pricing(assets, start_time, end_time, fields=pfield)
+    portfolio_price = np.dot(price, weight['weight'])
+    portfolio_mean = portfolio_price.mean()
+    portfolio_std = portfolio_price.std()
+    return pd.Series(portfolio_price, index=price.index), portfolio_mean, portfolio_std
+    
+    
+def get_adf(portfoliop_series):
+    adf =  adfuller(portfoliop_series.values)
+    return adf[1]
+        
+        
+def print_cleancode(weights):
+    for weight in weights:
+        print ('sids = np.array(['),
+        for i in range(len(weight)):
+            print(str(weight['sid'][i])+','),
+        print ('\b\b'),
+        print ('])')
+        print ('weights = np.array(['),
+        for i in range(len(weight)):
+            print(str(weight['weight'][i])+','),
+        print ('\b\b'),
+        print ('])')
+        print ('')
+
+
+
+
+
+###########################################################################################################
+#################################### Main Function#########################################################
+
+
+# Step 1: Get the stock price and the security identities.
+stockprice, sids = get_stock_price(sector, start_time=train_start, end_time=train_end, fields=field)
+print 'stockprice is a DataFrame with the shape: ', stockprice.shape
+print 'sids is a NumPy array with the shape: ', sids.shape
+
+
+# Step 2: Compute the "stationary matrix".
+stationary_matrix = get_stationary_matrix(stockprice, sids)
+print 'stationary_matrix is a symmetrical matrix with the shape: ', stationary_matrix.shape
+print 'take a glance on the stationary matrix: \n', stationary_matrix[0:5,0:5]
+
+
+# Step 3: Construct the portfolio according to the stationary matrix.
+tree_list = get_portfolio_tree(stockprice, sids, stationary_matrix, max_num_stocks) #this is cap for merging
+print 'tree_list is a list of binary tree, which stores the information of the portfolio.'
+print 'An instance of the binary tree is: '
+tree_list[0].print_tree(0)
+
+
+# Step 4: Get the weights of each portfolios.
+weights = reconstruct_portfolio(tree_list)
+w = 0
+while w < len(weights):
+    if len(weights[w]) == 1:
+        weights.pop(w)
+    else:
+        w += 1
+print 'The final output is a DataFrame which stores how many "weights" should be placed on each stock: '
+print weights[0].tail()
+print ('')
+# print_code(weights)
+# print_cleancode(weights)
+
+
+#Step 6: Get portfolio_price & portfolio mean & portfolio standard deviation
+print 'context.tech_avgs = np.array([', 
+for i in range(len(weights)):
+    portfolio_p, portfolio_mean, portfolio_std = get_portfolio_price(weights[i], train_start, train_end, 'price', frequency = 'daily')
+    print str(portfolio_mean)+',',
+print '\b\b])'
+
+print '\n'
+
+print 'context.tech_stds = np.array([', 
+for i in range(len(weights)):
+    portfolio_p, portfolio_mean, portfolio_std = get_portfolio_price(weights[i], train_start, train_end, 'price', frequency = 'daily')
+    print str(portfolio_std)+',',
+print '\b\b])'
+
+print '\n'
+
+print 'context.tech_sids = np.array([',
+for i in range(len(weights)):
+    print '[',
+    for j in range(len(weights[i])):
+        print str(weights[i]['sid'][j])+',',
+    print '\b\b],',
+print '\b\b])'
+print '\n'
+
+print 'context.tech_weights = np.array([',
+for i in range(len(weights)):
+    print '[',
+    for j in range(len(weights[i])):
+        print str(weights[i]['weight'][j])+',',
+    print '\b\b],',
+print '\b\b])'
+print '\n'
+
+print 'portfolio price series:' , portfolio_p.tail()
+print 'portfolio mean:' , portfolio_mean
+print 'portfolio standard deviation:' , portfolio_std
+
+
+###################### Output Generation ##################################################################
+
+trainportfolio_p, trainportfolio_mean, trainportfolio_std = get_portfolio_price(weights[0], train_start, train_end, 'price', frequency = 'daily')
+print 'portfolio price series:' , trainportfolio_p.tail()
+print 'portfolio mean:' , trainportfolio_mean
+print 'portfolio standard deviation:' , trainportfolio_std
+
+
+trade_start = '2018-12-01'
+trade_end = '2019-01-01'
+portfolio_p, portfolio_mean, portfolio_std = get_portfolio_price(weights[0], trade_start, trade_end, 'price', frequency = 'daily')
+# print 'portfolio price series:' , portfolio_p.tail()
+print 'portfolio mean:' , portfolio_mean
+# print 'portfolio standard deviation:' , portfolio_std
+# print 'diff:' , portfolio_mean - trainportfolio_mean
+# (portfolio_p - trainportfolio_mean).mean()
+
+
+###########################################################################################################
+##############################################################################################################
+
+sample_err = []
+cv_err = []
+for i in range(len(weights)):
+    trainportfolio_p, trainportfolio_mean, trainportfolio_std = get_portfolio_price(weights[i], train_start, train_end, 'price', frequency = 'daily')
+    portfolio_p, portfolio_mean, portfolio_std = get_portfolio_price(weights[i], trade_start, trade_end, 'price', frequency = 'daily')
+    sample_err.append((((trainportfolio_p - trainportfolio_mean)**2)/63).mean())
+    cv_err.append((((portfolio_p - trainportfolio_mean)**2)/21).mean())
+# print sample_err
+print np.mean(sample_err)
+
+
+###########################################################################################################
+##############################################Cross Validation for Training Window with plots##################################################
+
+#Cross-Validation for training window
+ldate = ['2019-01-01','2019-02-01', '2019-03-01', '2019-04-01', '2019-05-01', '2019-06-01', '2019-07-01', '2019-08-01', '2019-09-01', '2019-10-01']
+
+field = 'close'
+sector = tech
+pl_sample_err = []
+pl_cv_err = []
+max_num_stocks = 7
+for i in range(1,7):
+    train_start = '2019-01-01'
+    train_end = ldate[i]
+    trade_start = ldate[i]
+    trade_end = ldate[i+1]
+    stockprice, sids = get_stock_price(sector, start_time=train_start, end_time=train_end, fields=field)
+    stationary_matrix = get_stationary_matrix(stockprice, sids)
+    tree_list = get_portfolio_tree(stockprice, sids, stationary_matrix, max_num_stocks)
+    weights = reconstruct_portfolio(tree_list)
+    w = 0
+    while w < len(weights):
+        if len(weights[w]) == 1:
+            weights.pop(w)
+        else:
+            w += 1
+#     print train_start, train_end, trade_start, trade_end
+    sample_err = []
+    cv_err = []
+    for j in range(len(weights)):
+        trainportfolio_p, trainportfolio_mean, trainportfolio_std = get_portfolio_price(weights[j], train_start, train_end, 'price', frequency = 'daily')
+        portfolio_p, portfolio_mean, portfolio_std = get_portfolio_price(weights[j], trade_start, trade_end, 'price', frequency = 'daily')
+        sample_err.append((((trainportfolio_p - trainportfolio_mean)**2)/(21*i)).mean())
+        cv_err.append((((portfolio_p - trainportfolio_mean)**2)/21).mean())
+    pl_sample_err.append(np.mean(sample_err))
+    pl_cv_err.append(np.mean(cv_err))
+#     print np.mean(sample_err)
+print pl_sample_err
+print pl_cv_err
+# print cv_err
+print np.mean(cv_err)
+
+
+plt.plot([1, 2, 3, 4, 5, 6], pl_sample_err, label='In Sample')
+plt.plot([1, 2, 3, 4, 5, 6], pl_cv_err, label='CV')
+plt.legend()
+plt.xlabel("Training window")
+plt.ylabel("MSE")
+
+
+###########################################################################################################
+##############################################Cross Validation for Max number of stock in a portfolio##############
+
+
+#Cross-Validation for max number of stock
+ldate = ['2019-01-01','2019-02-01', '2019-03-01', '2019-04-01', '2019-05-01', '2019-06-01', '2019-07-01', '2019-08-01', '2019-09-01', '2019-10-01']
+
+field = 'close'
+sector = tech
+pl_sample_err = []
+pl_cv_err = []
+# max_num_stocks = 7
+train_start = '2019-01-01'
+train_end = '2019-06-01'
+trade_start = '2019-06-01'
+trade_end = '2019-07-01'
+
+for mstock in range(2,30):
+    max_num_stocks = mstock
+    stockprice, sids = get_stock_price(sector, start_time=train_start, end_time=train_end, fields=field)
+    stationary_matrix = get_stationary_matrix(stockprice, sids)
+    tree_list = get_portfolio_tree(stockprice, sids, stationary_matrix, max_num_stocks)
+    weights = reconstruct_portfolio(tree_list)
+    w = 0
+    while w < len(weights):
+        if len(weights[w]) == 1:
+            weights.pop(w)
+        else:
+            w += 1
+    #     print train_start, train_end, trade_start, trade_end
+    sample_err = []
+    cv_err = []
+    for j in range(len(weights)):
+        trainportfolio_p, trainportfolio_mean, trainportfolio_std = get_portfolio_price(weights[j], train_start, train_end, 'price', frequency = 'daily')
+        portfolio_p, portfolio_mean, portfolio_std = get_portfolio_price(weights[j], trade_start, trade_end, 'price', frequency = 'daily')
+        sample_err.append((((trainportfolio_p - trainportfolio_mean)**2)/(21*i)).mean())
+        cv_err.append((((portfolio_p - trainportfolio_mean)**2)/21).mean())
+    pl_sample_err.append(np.mean(sample_err))
+    pl_cv_err.append(np.mean(cv_err))
+#     print np.mean(sample_err)
+print pl_sample_err
+print pl_cv_err
+
+
+plt.plot([2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29], pl_sample_err, label='In Sample')
+plt.plot([2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29], pl_cv_err, label='CV')
+plt.legend()
+plt.xlabel("Max # stocks")
+plt.ylabel("MSE")
+
+
+##############################################################################################################
+##############################################################################################################
+
+
